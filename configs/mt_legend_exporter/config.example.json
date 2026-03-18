@@ -1,0 +1,14 @@
+{
+  "active_poll_interval_sec": 5,
+  "auth_token": "",
+  "client_label": "test-client",
+  "debug": false,
+  "enabled": true,
+  "endpoint": "",
+  "max_log_size_kb": 512,
+  "poll_interval_sec": 300,
+  "request_stall_timeout_sec": 8,
+  "request_timeout_sec": 10,
+  "send_only_on_change": true,
+  "send_player_name": false
+}
