@@ -24,11 +24,21 @@ fi
 AUTH_HEADER="Authorization: Bearer ${TOKEN}"
 ACCEPT_HEADER="Accept: application/vnd.github+json"
 
-LOGIN="$(
-  curl -fsSL \
+USER_HTTP_CODE="$(
+  curl -sS -o /tmp/github-user.json -w "%{http_code}" \
     -H "${AUTH_HEADER}" \
     -H "${ACCEPT_HEADER}" \
-    https://api.github.com/user | python3 -c 'import json,sys; print(json.load(sys.stdin)["login"])'
+    https://api.github.com/user
+)"
+
+if [[ "${USER_HTTP_CODE}" != "200" ]]; then
+  echo "GitHub token is invalid or has no access to /user."
+  cat /tmp/github-user.json
+  exit 1
+fi
+
+LOGIN="$(
+  python3 -c 'import json,sys; print(json.load(open("/tmp/github-user.json", "r", encoding="utf-8"))["login"])'
 )"
 
 PRIVATE=false
