@@ -3,7 +3,11 @@ __pycache__/
 *.pyo
 
 build/
-dist/install/
+dist/install/*
+!dist/install/mods/
+dist/install/mods/*
+!dist/install/mods/mod_mt_legend_exporter.mtmod
+dist/install/mods/configs/
 
 server_example/storage/
 

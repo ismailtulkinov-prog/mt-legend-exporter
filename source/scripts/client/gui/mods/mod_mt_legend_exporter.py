@@ -3,6 +3,7 @@ from __future__ import print_function
 
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -21,24 +22,33 @@ try:
 except ImportError:
     import urllib.request as urllib2
 
+try:
+    import ssl
+except ImportError:
+    ssl = None
+
 MOD_ID = 'mt_legend_exporter'
-MOD_VERSION = '0.1.9'
+MOD_VERSION = '0.1.11'
 CONFIG_DIR = os.path.join(os.getcwd(), 'mods', 'configs', MOD_ID)
 CONFIG_PATH = os.path.join(CONFIG_DIR, 'config.json')
 LOG_PATH = os.path.join(CONFIG_DIR, 'exporter.log')
 LOG_BACKUP_PATH = os.path.join(CONFIG_DIR, 'exporter.log.1')
 SNAPSHOT_PATH = os.path.join(CONFIG_DIR, 'latest_snapshot.json')
+STATUS_PATH = os.path.join(CONFIG_DIR, 'status.json')
 
 DEFAULT_CONFIG = {
     'active_poll_interval_sec': 5,
     'enabled': True,
-    'endpoint': 'http://77.91.77.218:18787/mt/legend/ingest',
-    'auth_token': '2ed8bc656c66a03192899ecbcf4a3821',
+    'endpoint': '',
+    'auth_token': '',
     'client_label': '',
     'max_log_size_kb': 512,
     'poll_interval_sec': 300,
     'request_stall_timeout_sec': 8,
     'request_timeout_sec': 10,
+    'send_retry_base_delay_sec': 15,
+    'send_retry_max_delay_sec': 300,
+    'ui_hook_retry_interval_sec': 30,
     'send_only_on_change': True,
     'send_player_name': False,
     'debug': False
@@ -54,14 +64,24 @@ def _now_ts():
     return int(time.time())
 
 
+def _coerce_int(value, default):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
 class MTLegendExporter(object):
     def __init__(self):
         self._running = False
         self._request_in_flight = False
         self._callback_id = None
         self._config = {}
-        self._last_sent_key = None
         self._last_local_key = None
+        self._last_send_success_key = None
+        self._send_in_flight_key = None
+        self._consecutive_send_failures = 0
+        self._next_send_retry_ts = 0
         self._warned_no_endpoint = False
         self._warned_season_fallback = False
         self._api_logged = False
@@ -73,21 +93,52 @@ class MTLegendExporter(object):
         self._ui_legend_position = None
         self._ui_hooks_ready = False
         self._ui_hooks_logged = False
+        self._last_unchanged_log_ts = None
+        self._send_state_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._status = {
+            'mod_id': MOD_ID,
+            'mod_version': MOD_VERSION,
+            'running': False,
+            'ui_hooks_ready': False
+        }
 
     def start(self, delay=45):
         self._load_config()
         if not self._config.get('enabled', True):
             self._log('disabled in config')
+            self._update_status(
+                running=False,
+                enabled=False,
+                endpoint_configured=bool(self._config.get('endpoint')),
+                last_state='disabled'
+            )
             return
         self._ensure_ui_hooks()
         self._running = True
         self._schedule_next(delay)
+        self._update_status(
+            running=True,
+            enabled=True,
+            endpoint_configured=bool(self._config.get('endpoint')),
+            ui_hooks_ready=self._ui_hooks_ready,
+            started_at_ts=_now_ts(),
+            last_state='started'
+        )
         self._log('started')
 
     def stop(self):
         self._running = False
         self._request_in_flight = False
         self._cancel_callback()
+        with self._send_state_lock:
+            self._send_in_flight_key = None
+        self._update_status(
+            running=False,
+            ui_hooks_ready=self._ui_hooks_ready,
+            stopped_at_ts=_now_ts(),
+            last_state='stopped'
+        )
         self._log('stopped')
 
     def trigger_soon(self, delay=15):
@@ -108,7 +159,7 @@ class MTLegendExporter(object):
         if not self._running:
             return
         if delay is None:
-            delay = max(60, int(self._config.get('poll_interval_sec', 300)))
+            delay = self._get_idle_poll_delay()
         self._cancel_callback()
         self._callback_id = BigWorld.callback(float(delay), self._poll)
 
@@ -125,12 +176,33 @@ class MTLegendExporter(object):
         loaded = json.loads(raw.decode('utf-8'))
         config = dict(DEFAULT_CONFIG)
         config.update(loaded)
-        if not str(config.get('endpoint', '')).strip():
-            config['endpoint'] = DEFAULT_CONFIG['endpoint']
-        if not str(config.get('auth_token', '')).strip():
-            config['auth_token'] = DEFAULT_CONFIG['auth_token']
+        config['endpoint'] = str(config.get('endpoint', '')).strip()
+        config['auth_token'] = str(config.get('auth_token', '')).strip()
         self._config = config
         return config
+
+    def _get_idle_poll_delay(self):
+        base_delay = max(60, int(self._config.get('poll_interval_sec', 300)))
+        if self._ui_hooks_ready:
+            return base_delay
+
+        retry_delay = max(10, int(self._config.get('ui_hook_retry_interval_sec', 30)))
+        return min(base_delay, retry_delay)
+
+    def _get_send_retry_base_delay(self):
+        return max(5, _coerce_int(self._config.get('send_retry_base_delay_sec', 15), 15))
+
+    def _get_send_retry_max_delay(self):
+        return max(self._get_send_retry_base_delay(), _coerce_int(self._config.get('send_retry_max_delay_sec', 300), 300))
+
+    def _get_send_retry_delay(self, failure_count):
+        delay = self._get_send_retry_base_delay()
+        if failure_count > 1:
+            try:
+                delay *= (2 ** (failure_count - 1))
+            except Exception:
+                delay = self._get_send_retry_max_delay()
+        return min(delay, self._get_send_retry_max_delay())
 
     def _rotate_log_if_needed(self):
         try:
@@ -162,6 +234,92 @@ class MTLegendExporter(object):
 
     def _log_exception(self, title):
         self._log('%s\n%s' % (title, traceback.format_exc()), force=True)
+
+    def _update_status(self, **fields):
+        try:
+            _ensure_dir(CONFIG_DIR)
+            with self._status_lock:
+                self._status['mod_id'] = MOD_ID
+                self._status['mod_version'] = MOD_VERSION
+                self._status.update(fields)
+                raw = json.dumps(self._status, indent=2, sort_keys=True).encode('utf-8')
+                tmp_path = STATUS_PATH + '.tmp'
+                with open(tmp_path, 'wb') as stream:
+                    stream.write(raw)
+                if os.path.isfile(STATUS_PATH):
+                    try:
+                        os.remove(STATUS_PATH)
+                    except Exception:
+                        pass
+                os.rename(tmp_path, STATUS_PATH)
+        except Exception:
+            pass
+
+    def _mark_poll_status(self, state):
+        self._update_status(
+            last_poll_ts=_now_ts(),
+            last_poll_state=state,
+            running=self._running,
+            ui_hooks_ready=self._ui_hooks_ready
+        )
+
+    def _mark_snapshot_status(self, payload):
+        self._update_status(
+            last_snapshot_ts=_now_ts(),
+            last_poll_state='snapshot_saved',
+            last_legend_threshold=payload.get('legend_threshold'),
+            last_legend_position_threshold=payload.get('legend_position_threshold'),
+            last_recalculation_ts=payload.get('last_recalculation_ts'),
+            last_polled_at_ts=payload.get('polled_at_ts'),
+            last_client_label=payload.get('client_label', ''),
+            running=self._running,
+            ui_hooks_ready=self._ui_hooks_ready
+        )
+
+    def _describe_send_error(self, error):
+        if isinstance(error, urllib2.HTTPError):
+            code = getattr(error, 'code', None)
+            if code is None:
+                return ('http_error', 'HTTP error', None)
+            return ('http_%s' % code, 'HTTP %s' % code, code)
+
+        if isinstance(error, urllib2.URLError):
+            reason = getattr(error, 'reason', None)
+            if isinstance(reason, socket.timeout):
+                return ('timeout', 'timed out', None)
+            if ssl is not None and isinstance(reason, ssl.SSLError):
+                return ('ssl', str(reason), None)
+            if isinstance(reason, socket.gaierror):
+                return ('dns', str(reason), None)
+            if isinstance(reason, socket.error):
+                lower = str(reason).lower()
+                if 'refused' in lower:
+                    return ('connection_refused', str(reason), None)
+                if 'reset' in lower:
+                    return ('connection_reset', str(reason), None)
+                return ('socket', str(reason), None)
+
+            detail = str(reason or error)
+            lower = detail.lower()
+            if 'timed out' in lower or 'timeout' in lower:
+                return ('timeout', detail, None)
+            if 'certificate' in lower or 'ssl' in lower or 'tls' in lower:
+                return ('ssl', detail, None)
+            if 'name or service not known' in lower or 'temporary failure in name resolution' in lower:
+                return ('dns', detail, None)
+            if 'nodename nor servname provided' in lower or 'getaddrinfo failed' in lower:
+                return ('dns', detail, None)
+            if 'refused' in lower:
+                return ('connection_refused', detail, None)
+            if 'reset' in lower:
+                return ('connection_reset', detail, None)
+            return ('network', detail, None)
+
+        if ssl is not None and isinstance(error, ssl.SSLError):
+            return ('ssl', str(error), None)
+        if isinstance(error, socket.timeout):
+            return ('timeout', str(error), None)
+        return ('unexpected', str(error) or error.__class__.__name__, None)
 
     def _get_attr_value(self, obj, attr_names, default=None):
         for name in attr_names:
@@ -266,6 +424,24 @@ class MTLegendExporter(object):
 
     def _get_active_poll_delay(self):
         return max(3, int(self._config.get('active_poll_interval_sec', 5)))
+
+    def _log_unchanged_snapshot_if_needed(self, payload):
+        if not self._config.get('debug', False):
+            return
+
+        now_ts = _now_ts()
+        min_interval = max(60, int(self._config.get('poll_interval_sec', 300)))
+        if self._last_unchanged_log_ts is not None and (now_ts - self._last_unchanged_log_ts) < min_interval:
+            return
+
+        self._last_unchanged_log_ts = now_ts
+        self._log(
+            'snapshot unchanged: threshold=%s update=%s' % (
+                payload.get('legend_threshold'),
+                payload.get('last_recalculation_ts')
+            ),
+            force=True
+        )
 
     def _read_cached_leaderboard_state(self, leaderboard):
         last_update_ts = getattr(leaderboard, '_LeaderboardDataProvider__lastUpdateTimestamp', None)
@@ -423,6 +599,7 @@ class MTLegendExporter(object):
 
         if ok:
             self._ui_hooks_ready = True
+            self._update_status(ui_hooks_ready=True, last_state='ui_hooks_installed')
             self._log('UI hooks installed', force=True)
         return ok
 
@@ -433,7 +610,9 @@ class MTLegendExporter(object):
         try:
             self._load_config()
             self._ensure_ui_hooks()
+            self._mark_poll_status('poll_started')
             if not self._config.get('enabled', True):
+                self._mark_poll_status('disabled')
                 self._schedule_next()
                 return
             comp7_ctrl = dependency.instance(IComp7Controller)
@@ -451,12 +630,15 @@ class MTLegendExporter(object):
                     )
                     self._clear_request_state()
                 else:
+                    self._mark_poll_status('request_in_flight')
                     self._schedule_next(self._get_active_poll_delay())
                     return
             if comp7_ctrl is None:
+                self._mark_poll_status('waiting_for_comp7')
                 self._schedule_next()
                 return
             if not comp7_ctrl.isEnabled() or not self._has_active_season(comp7_ctrl):
+                self._mark_poll_status('season_inactive')
                 self._schedule_next()
                 return
             if leaderboard is None:
@@ -479,6 +661,7 @@ class MTLegendExporter(object):
                     )
                     self._clear_request_state()
                 else:
+                    self._mark_poll_status('request_in_flight')
                     self._schedule_next(self._get_active_poll_delay())
                     return
             request_seq = self._start_request('getLastUpdateTime')
@@ -486,6 +669,7 @@ class MTLegendExporter(object):
             self._schedule_next(self._get_active_poll_delay())
         except Exception:
             self._clear_request_state()
+            self._mark_poll_status('poll_failed')
             self._log_exception('poll failed')
             self._schedule_next()
 
@@ -627,6 +811,7 @@ class MTLegendExporter(object):
             _ensure_dir(CONFIG_DIR)
             with open(SNAPSHOT_PATH, 'wb') as stream:
                 stream.write(json.dumps(payload, indent=2, sort_keys=True).encode('utf-8'))
+            self._mark_snapshot_status(payload)
         except Exception:
             self._log_exception('failed to save local snapshot')
 
@@ -642,26 +827,62 @@ class MTLegendExporter(object):
             self._log('new local snapshot: threshold=%s update=%s' % (
                 payload.get('legend_threshold'), payload.get('last_recalculation_ts')
             ), force=True)
+        else:
+            self._log_unchanged_snapshot_if_needed(payload)
         endpoint = self._config.get('endpoint', '').strip()
         if not endpoint:
             if not self._warned_no_endpoint:
                 self._warned_no_endpoint = True
                 self._log('endpoint is empty, snapshot will only be saved locally', force=True)
+            self._update_status(
+                endpoint_configured=False,
+                send_state='local_only',
+                last_state='no_endpoint'
+            )
             return
+        self._update_status(endpoint_configured=True)
         should_send = True
         if self._config.get('send_only_on_change', True):
-            should_send = local_key != self._last_sent_key
+            should_send = local_key != self._last_send_success_key
         if not should_send:
+            self._update_status(
+                send_state='unchanged_skip',
+                last_state='snapshot_unchanged'
+            )
             return
-        self._last_sent_key = local_key
-        thread = threading.Thread(target=self._send_payload_worker, args=(payload,))
+        now_ts = _now_ts()
+        with self._send_state_lock:
+            if self._send_in_flight_key == local_key:
+                return
+            if now_ts < self._next_send_retry_ts:
+                self._update_status(
+                    send_state='backoff',
+                    next_send_retry_ts=self._next_send_retry_ts,
+                    consecutive_send_failures=self._consecutive_send_failures,
+                    last_state='waiting_for_send_retry'
+                )
+                return
+            self._send_in_flight_key = local_key
+        self._update_status(
+            send_state='sending',
+            last_send_attempt_ts=now_ts,
+            last_send_threshold=payload.get('legend_threshold'),
+            last_state='sending_payload'
+        )
+        thread = threading.Thread(target=self._send_payload_worker, args=(payload, local_key))
         try:
             thread.setDaemon(True)
         except Exception:
             pass
-        thread.start()
+        try:
+            thread.start()
+        except Exception:
+            with self._send_state_lock:
+                self._send_in_flight_key = None
+            self._update_status(send_state='send_thread_failed', last_state='send_thread_failed')
+            self._log_exception('failed to start send thread')
 
-    def _send_payload_worker(self, payload):
+    def _send_payload_worker(self, payload, local_key):
         try:
             data = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')
             request = urllib2.Request(self._config.get('endpoint', '').strip(), data=data)
@@ -675,16 +896,62 @@ class MTLegendExporter(object):
                 response.read()
             except Exception:
                 pass
+            with self._send_state_lock:
+                self._send_in_flight_key = None
+                self._last_send_success_key = local_key
+                self._consecutive_send_failures = 0
+                self._next_send_retry_ts = 0
+            self._update_status(
+                send_state='ok',
+                last_send_success_ts=_now_ts(),
+                last_send_http_status=status_code,
+                last_send_error='',
+                last_send_error_category='',
+                last_send_error_ts=0,
+                consecutive_send_failures=0,
+                next_send_retry_ts=0,
+                last_state='send_ok'
+            )
             self._log('payload sent, status=%s threshold=%s' % (
                 status_code, payload.get('legend_threshold')
             ), force=True)
-        except Exception:
-            self._log_exception('payload send failed')
+        except Exception as error:
+            category, detail, http_status = self._describe_send_error(error)
+            failure_ts = _now_ts()
+            with self._send_state_lock:
+                self._send_in_flight_key = None
+                self._consecutive_send_failures += 1
+                failure_count = self._consecutive_send_failures
+                retry_delay = self._get_send_retry_delay(failure_count)
+                self._next_send_retry_ts = failure_ts + retry_delay
+                next_retry_ts = self._next_send_retry_ts
+            self._update_status(
+                send_state='error',
+                last_send_http_status=http_status or 0,
+                last_send_error=detail,
+                last_send_error_category=category,
+                last_send_error_ts=failure_ts,
+                consecutive_send_failures=failure_count,
+                next_send_retry_ts=next_retry_ts,
+                last_state='send_error'
+            )
+            self._log(
+                'payload send failed: category=%s detail=%s retry_in=%ss threshold=%s' % (
+                    category,
+                    detail,
+                    retry_delay,
+                    payload.get('legend_threshold')
+                ),
+                force=True
+            )
+            if self._config.get('debug', False):
+                self._log(traceback.format_exc(), force=True)
 
     def _request_done(self, message=None):
         self._clear_request_state()
         if message and self._config.get('debug', False):
             self._log(message, force=True)
+        self._mark_poll_status(message or 'request_done')
         self._schedule_next()
 
 

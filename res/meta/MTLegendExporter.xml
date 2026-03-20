@@ -1,6 +1,6 @@
 <root>
     <id>MTLegendExporter</id>
-  <version>0.1.9</version>
+  <version>0.1.11</version>
     <name>Mir Tankov Legend Exporter</name>
     <description>Exports the current Onslaught Legend threshold from the client to a local file and webhook.</description>
 </root>
