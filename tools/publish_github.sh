@@ -4,10 +4,15 @@ set -euo pipefail
 REPO_NAME="${1:-mt-legend-exporter}"
 VISIBILITY="${2:-public}"
 DESCRIPTION="${3:-Mod for Mir Tankov that exports the Onslaught Legend threshold from the client}"
+TOKEN_FILE="${GITHUB_TOKEN_FILE:-/root/clawd/secrets/github_token}"
 TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 
+if [[ -z "${TOKEN}" && -f "${TOKEN_FILE}" ]]; then
+  TOKEN="$(tr -d '\r\n' < "${TOKEN_FILE}")"
+fi
+
 if [[ -z "${TOKEN}" ]]; then
-  echo "Set GITHUB_TOKEN or GH_TOKEN first."
+  echo "Set GITHUB_TOKEN/GH_TOKEN or store a token in ${TOKEN_FILE}."
   exit 1
 fi
 
